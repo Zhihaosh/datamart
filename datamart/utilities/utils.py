@@ -8,8 +8,9 @@ import json
 from jsonschema import validate
 from termcolor import colored
 import typing
-from pandas import DataFrame
+import pandas as pd
 import tempfile
+from datetime import datetime
 from datamart.utilities.timeout import timeout
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../materializers'))
@@ -30,6 +31,10 @@ class Utils:
 
     MATERIALIZATION_TIME_OUT = 300
 
+    CATEGORICAL_COLUMN_THRESHOLD = 0.2
+
+    DEFAULT_START_DATE = "1900-01-01T00:00:00"
+
     @staticmethod
     def date_validate(date_text: str) -> typing.Optional[str]:
         """Validate if a string is a valid date.
@@ -44,7 +49,7 @@ class Utils:
         try:
             this_datetime = dateutil.parser.parse(date_text)
         except ValueError:
-            warnings.warn("Incorrect datatime format")
+            warnings.warn("Incorrect datetime format")
             return None
         return this_datetime.isoformat()
 
@@ -106,7 +111,7 @@ class Utils:
     @timeout(seconds=MATERIALIZATION_TIME_OUT, error_message="Materialization times out")
     def materialize(cls,
                     metadata: dict,
-                    constrains: dict = None) -> typing.Optional[DataFrame]:
+                    constrains: dict = None) -> typing.Optional[pd.DataFrame]:
         """Get the dataset with materializer.
 
        Args:
@@ -119,7 +124,7 @@ class Utils:
        """
         materializer = cls.load_materializer(materializer_module=metadata["materialization"]["python_path"])
         df = materializer.get(metadata=metadata, constrains=constrains)
-        if isinstance(df, DataFrame):
+        if isinstance(df, pd.DataFrame):
             return df
         return None
 
@@ -142,6 +147,10 @@ class Utils:
 
     @staticmethod
     def test_print(func) -> typing.Callable:
+        """A decorator for test print.
+
+        """
+
         def __decorator(self):
             print("[Test]{}/{}".format(self.__class__.__name__, func.__name__))
             func(self)
@@ -149,40 +158,168 @@ class Utils:
 
         return __decorator
 
-    @staticmethod
-    def get_highlight_match_from_metadata(metadata: dict, fields: list) -> dict:
-        """Get highlight match, highlight match is the string in some fields of doc which is matched by this query.
+    @classmethod
+    def is_categorical_column(cls, col: pd.Series) -> bool:
+        """check if column is categorical.
 
-        Args:
-            metadata: hitted result returned by es query
-            fields: list of fields
-
-        Returns:
-            boolean
         """
 
-        highlights = metadata.get("highlight", {})
-        return {field: highlights[field] for field in fields if field in highlights}
+        return col.nunique() / col.size < cls.CATEGORICAL_COLUMN_THRESHOLD
 
     @staticmethod
-    def get_offset_and_matched_queries_from_variable_metadata(metadata: dict) -> typing.Optional[typing.List[tuple]]:
-        """Get offset of nested object got matched and which query string in matched.
+    def get_inner_hits_info(hitted_es_result: dict, nested_key: str = "variables") -> typing.Optional[
+        typing.List[dict]]:
+        """Get offset of nested object got matched,
+        which query string is matched and which string in document got matched.
 
         Args:
-            metadata: hitted result returned by es query
+            hitted_es_result: hitted result returned by es query
+            nested_key: nested_key in the doc, default is variables for out metadata index
 
         Returns:
-            boolean
+            list of dictionary
+            offset: offset of nested object in variables
+            matched_queries: which query string got matched
+            highlight: which string in original doc got matched
         """
 
-        matched_queries_lst = metadata.get("inner_hits", {}).get("variables", {}).get("hits", {}).get("hits", [])
+        matched_queries_lst = hitted_es_result.get("inner_hits", {}).get(nested_key, {}).get("hits", {}).get("hits",
+                                                                                                             [])
         if not matched_queries_lst:
             return None
-        return [(matched_queries_lst[idx]["_nested"]["offset"], matched_queries_lst[idx]["matched_queries"])
-                for idx in range(len(matched_queries_lst))]
+        return [{
+            "offset": matched_queries_lst[idx]["_nested"]["offset"],
+            "matched_queries": matched_queries_lst[idx]["matched_queries"],
+            "highlight": matched_queries_lst[idx]["highlight"]
+        } for idx in range(len(matched_queries_lst))]
+
+    @staticmethod
+    def get_named_entity_constrain_from_inner_hits(matches: typing.List[dict]) -> dict:
+        """Generate named entity constrain from get_inner_hits_info method result
+
+         Args:
+             matches: result returned by get_inner_hits_info method
+
+         Returns:
+            dict
+         """
+
+        result = dict()
+        for matched in matches:
+            result[matched["offset"]] = matched["highlight"]["variables.named_entity"]
+        return result
 
     @classmethod
-    def generate_metadata_from_dataframe(cls, data: DataFrame) -> dict:
+    def is_column_able_to_query(cls, col: pd.Series) -> bool:
+        """Determine if a column is able for quering
+        Basically means it is a named entity column
+
+         Args:
+             col: pandas Series
+
+         Returns:
+              boolean
+         """
+        from datamart.profilers.basic_profiler import BasicProfiler
+
+        return BasicProfiler.named_entity_column_recognize(col)
+
+    @staticmethod
+    def append_columns_for_implicit_variables(implicit_variables: typing.List[dict], df: pd.DataFrame) -> pd.DataFrame:
+        """Append implicit_variables as new column with same value across all rows of the dataframe
+
+         Args:
+             implicit_variables: list of implicit_variables in metadata
+             df: Dataframe that implicit_variables will be appended on
+
+         Returns:
+              Dataframe with appended implicit_variables columns
+         """
+
+        for implicit_variable in implicit_variables:
+            df[implicit_variable["name"]] = implicit_variable["value"]
+        return df
+
+    @staticmethod
+    def get_metadata_intersection(*metadata_lst) -> list:
+        """Get the intersect metadata list.
+
+       Args:
+           metadata_lst: all metadata list returned by multiple queries
+
+       Returns:
+            list of intersect metadata
+       """
+
+        metadata_dict = dict()
+        metadata_sets = []
+        for lst in metadata_lst:
+            this_set = set()
+            for x in lst:
+                if x["_source"]["datamart_id"] not in metadata_dict:
+                    metadata_dict[x["_source"]["datamart_id"]] = x
+                elif "inner_hits" in x:
+                    metadata_dict[x["_source"]["datamart_id"]] = x
+                this_set.add(x["_source"]["datamart_id"])
+            metadata_sets.append(this_set)
+        return [metadata_dict[datamart_id] for datamart_id in metadata_sets[0].intersection(*metadata_sets[1:])]
+
+    @classmethod
+    def get_dataset(cls,
+                    metadata: dict,
+                    variables: list = None,
+                    constrains: dict = None
+                    ) -> typing.Optional[pd.DataFrame]:
+        """Get the dataset with materializer.
+
+       Args:
+           metadata: metadata dict.
+           variables: list of integers
+           constrains:
+
+       Returns:
+            pandas dataframe
+       """
+
+        if not constrains:
+            constrains = dict()
+
+        if constrains.get("date_range", None):
+            if constrains["date_range"].get("start", None) and not constrains["date_range"].get("end", None):
+                constrains["date_range"]["end"] = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+
+            if not constrains["date_range"].get("start", None) and constrains["date_range"].get("end", None):
+                constrains["date_range"]["start"] = cls.DEFAULT_START_DATE
+
+        df = cls.materialize(metadata=metadata, constrains=constrains)
+
+        if variables:
+            df = df.iloc[:, variables]
+
+        if metadata.get("implicit_variables", None):
+            df = cls.append_columns_for_implicit_variables(metadata["implicit_variables"], df)
+
+        return df.infer_objects()
+
+    @staticmethod
+    def calculate_dsbox_features(data: pd.DataFrame, metadata: typing.Union[dict, None]) -> dict:
+        """Calculate dsbox features, add to metadata dictionary
+
+         Args:
+             data: dataset as a pandas dataframe
+             metadata: metadata dict
+
+         Returns:
+              updated metadata dict
+         """
+
+        from datamart.profilers.dsbox_profiler import DSboxProfiler
+        if not metadata:
+            return metadata
+        return DSboxProfiler().profile(inputs=data, metadata=metadata)
+
+    @classmethod
+    def generate_metadata_from_dataframe(cls, data: pd.DataFrame) -> dict:
         """Generate a default metadata just from the data, without the dataset schema
 
          Args:
@@ -191,35 +328,17 @@ class Utils:
          Returns:
               metadata dict
          """
-
-        from datamart.profiler import Profiler
-        from datamart.metadata.global_metadata import GlobalMetadata
-        from datamart.metadata.variable_metadata import VariableMetadata
-
-        profiler = Profiler()
+        from datamart.profilers.basic_profiler import BasicProfiler, VariableMetadata, GlobalMetadata
 
         global_metadata = GlobalMetadata.construct_global(description=cls.DEFAULT_DESCRIPTION)
         for col_offset in range(data.shape[1]):
-            variable_metadata = profiler.basic_profiler.basic_profiling_column(
+            variable_metadata = BasicProfiler.basic_profiling_column(
                 description={},
                 variable_metadata=VariableMetadata.construct_variable(description={}),
                 column=data.iloc[:, col_offset]
             )
             global_metadata.add_variable_metadata(variable_metadata)
-        global_metadata = profiler.basic_profiler.basic_profiling_entire(global_metadata=global_metadata, data=data)
+        global_metadata = BasicProfiler.basic_profiling_entire(global_metadata=global_metadata,
+                                                                              data=data)
 
         return global_metadata.value
-
-    @staticmethod
-    def materialize_time_out_handler(signum, frame):
-        """Materialization times out handler
-
-         Args:
-             signum
-             frame
-
-         Returns:
-
-         """
-
-        raise Exception(colored("Materialization times out", 'red'))
